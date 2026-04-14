@@ -1,0 +1,7 @@
+# Server logs — contain device IPs and memory addresses
+logs/
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
